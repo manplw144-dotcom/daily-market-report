@@ -1,0 +1,56 @@
+name: Daily Market Report
+
+on:
+  schedule:
+    # 01:00 UTC = 08:00 Thailand
+    - cron: '0 1 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance requests
+      - name: Run daily report
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'EOF'
+import os, datetime, yfinance as yf, requests
+
+TICKERS = {"IONQ":56.2,"FLY":24.635,"LUNR":9.23}
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+def price(t):
+    d=yf.Ticker(t).history(period="5d")
+    if d.empty: return None
+    p=float(d['Close'][-1])
+    pc=float(d['Close'][-2]) if len(d)>1 else p
+    ch=p-pc; pct=ch/pc*100
+    return p,round(pct,2)
+
+msg=f"📅 รายงานตลาดประจำวันที่ {datetime.datetime.utcnow()+datetime.timedelta(hours=7):%Y-%m-%d %H:%M} (TH)\n\n"
+for t,c in TICKERS.items():
+    try:
+        p,pct=price(t)
+        if not p: continue
+        act="ถือ"
+        if t=="IONQ" and p<50: act="ซื้อเพิ่ม"
+        if t=="FLY" and p<20: act="ซื้อเพิ่ม"
+        if t=="LUNR" and p<=9.5: act="ซื้อเพิ่ม"
+        msg+=f"{t}: ${p:.2f} ({pct:+.2f}%) | avg ${c} → {act}\n"
+    except Exception as e:
+        msg+=f"{t}: ข้อมูลขาดหาย\n"
+requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+              data={"chat_id":CHAT_ID,"text":msg})
+EOF
