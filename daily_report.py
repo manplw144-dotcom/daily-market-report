@@ -1,353 +1,405 @@
 # daily_report.py
-# Enhanced Daily Market + Portfolio report (with English->Thai translation)
-# Requirements: yfinance, requests
+# Improved Daily Report with extractive summarization + Thai translation
+# Requirements: yfinance, requests, beautifulsoup4
 # Env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-import os
-import re
+import os, re, time, datetime, requests, math
 from html import unescape
-import datetime
-import requests
+from collections import Counter
+from bs4 import BeautifulSoup
 import yfinance as yf
 import urllib.parse
-import time
 
-# ---------- CONFIG ----------
-TICKERS = {
-    "IONQ": 56.2,
-    "FLY": 24.635,
-    "LUNR": 9.23
-}
+# -------- CONFIG ----------
+TICKERS = {"IONQ":56.2, "FLY":24.635, "LUNR":9.23}
+HEADERS = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 MARKETAUX_TOKEN = "demo"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 # --------------------------------
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-def log(s):
-    print(f"[DEBUG] {s}")
+def log(s): print(f"[DEBUG] {s}")
 
-# --- Translation helper: English -> Thai (uses public translate endpoint) ---
+# ---------- UTILITIES ----------
 def translate_to_th(text):
-    """
-    Translate given English text to Thai using unofficial Google translate endpoint.
-    Returns Thai text on success, otherwise returns original text.
-    """
-    if not text or text.strip() == "":
-        return text
+    """Translate English text to Thai using public Google translate endpoint (best-effort)."""
+    if not text: return text
     try:
-        # batch small pieces to avoid very long URLs; handle up to ~2000 chars
-        q = str(text)
-        # encode
-        q_enc = urllib.parse.quote(q)
+        q_enc = urllib.parse.quote(text)
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=th&dt=t&q={q_enc}"
-        r = requests.get(url, timeout=10, headers=HEADERS)
+        r = requests.get(url, timeout=12, headers=HEADERS)
         if r.status_code != 200:
-            log(f"translate status {r.status_code}")
             return text
         resp = r.json()
-        # resp is list of sentences -> join
-        translated = []
-        for part in resp[0]:
-            if len(part) > 0:
-                translated.append(part[0])
-        result = "".join(translated)
-        # minor cleanup
-        result = result.replace("  ", " ").strip()
-        # limit length
-        if len(result) > 4000:
-            result = result[:4000] + "..."
-        # small delay to be polite
-        time.sleep(0.1)
-        return result
+        translated = "".join([part[0] for part in resp[0] if part and part[0]])
+        time.sleep(0.08)
+        return translated.strip()
     except Exception as e:
-        log(f"translate err: {e}")
+        log("translate err "+str(e))
         return text
 
-# --- Prices ---
-def get_price(ticker):
+def fetch_url_text(url):
+    """Fetch article URL and extract visible paragraph text (returns combined text)."""
     try:
-        t = yf.Ticker(ticker)
-        d = t.history(period="5d")
-        if d.empty:
-            log(f"price: no data for {ticker}")
-            return None
-        last = float(d['Close'][-1])
-        prev = float(d['Close'][-2]) if len(d['Close']) > 1 else last
-        pct = (last - prev) / prev * 100 if prev != 0 else 0.0
-        return {"price": round(last, 4), "pct": round(pct, 2)}
+        r = requests.get(url, timeout=10, headers=HEADERS)
+        if r.status_code != 200:
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        # Remove script/style, nav, footer
+        for tag in soup(["script","style","nav","footer","header","aside","form","noscript"]):
+            tag.decompose()
+        # Try common article containers
+        article_text = []
+        # Priority: <article> tags, then main, then <div> with many <p>, then all <p>
+        article = soup.find("article")
+        if article:
+            ps = article.find_all("p")
+            for p in ps:
+                txt = p.get_text().strip()
+                if txt:
+                    article_text.append(txt)
+        if not article_text:
+            main = soup.find("main")
+            if main:
+                for p in main.find_all("p"):
+                    txt = p.get_text().strip()
+                    if txt:
+                        article_text.append(txt)
+        if not article_text:
+            # fallback: choose largest div by text length
+            divs = soup.find_all("div")
+            best = ""
+            for d in divs:
+                txt = " ".join([p.get_text().strip() for p in d.find_all("p")])
+                if len(txt) > len(best):
+                    best = txt
+            if best:
+                # split into paragraphs
+                article_text += [t.strip() for t in best.split("\n") if t.strip()]
+        if not article_text:
+            # final fallback: take all <p>
+            for p in soup.find_all("p"):
+                txt = p.get_text().strip()
+                if txt:
+                    article_text.append(txt)
+        # join and normalize whitespace
+        joined = "\n".join(article_text)
+        # minor cleanup
+        joined = re.sub(r'\s+', ' ', joined).strip()
+        return joined
     except Exception as e:
-        log(f"price err {ticker}: {e}")
-        return None
+        log("fetch_url_text err "+str(e))
+        return ""
 
-# --- Market news (Marketaux -> Yahoo fallback) ---
-def get_market_news():
-    headlines = []
-    used_source = None
+def split_sentences(text):
+    """Naive sentence splitter (period/question/exclaim)."""
+    if not text: return []
+    # Replace abbreviations common in news to avoid split? keep simple
+    text = text.replace("\r"," ").replace("\n",". ")
+    # split by punctuation marks followed by space and capital letter or digit
+    sents = re.split(r'(?<=[\.\?\!])\s+(?=[A-Z0-9"])', text)
+    sents = [s.strip() for s in sents if s.strip()]
+    return sents
+
+def score_sentences(sentences, important_terms=None):
+    """
+    Score sentences by term frequency of important words + length heuristic.
+    important_terms: list of keywords to weight (e.g., earnings, revenue, acquisition)
+    """
+    if not sentences: return []
+    # normalize words
+    words = []
+    for s in sentences:
+        for w in re.findall(r"\w+", s.lower()):
+            words.append(w)
+    freq = Counter(words)
+    important_terms = [t.lower() for t in (important_terms or [])]
+    sent_scores = []
+    for s in sentences:
+        s_words = re.findall(r"\w+", s.lower())
+        if not s_words:
+            sent_scores.append((s,0.0))
+            continue
+        # base score = sum freq of words in sentence
+        base = sum(freq[w] for w in s_words)
+        # boost if contains important terms
+        boost = sum(3 for t in important_terms if t in s.lower())
+        # penalize very short sentences
+        length_penalty = 0.8 if len(s_words) < 6 else 1.0
+        score = base * (1 + boost) * length_penalty
+        sent_scores.append((s, score))
+    # sort by score desc
+    sent_scores.sort(key=lambda x: x[1], reverse=True)
+    return sent_scores
+
+def make_extract_summary(text, important_terms=None, max_sentences=3):
+    """
+    Create extractive summary: select top scored sentences and keep original order.
+    """
+    if not text:
+        return ""
+    sents = split_sentences(text)
+    if not sents:
+        return ""
+    scored = score_sentences(sents, important_terms)
+    # pick top N candidate sentences
+    top = [s for s,sc in scored[:max_sentences*3]]  # take more candidates to preserve order
+    # keep only sentences that are in top, but in original order
+    summary = []
+    for s in sents:
+        if s in top and s not in summary:
+            summary.append(s)
+        if len(summary) >= max_sentences:
+            break
+    # fallback: if no summary selected, take first N sentences
+    if not summary:
+        summary = sents[:max_sentences]
+    # join
+    return " ".join(summary)
+
+# ---------- News pipeline ----------
+def get_candidate_articles_from_yahoo(ticker):
+    """
+    Return list of dicts: {'title', 'url', 'publisher'} from Yahoo search endpoint.
+    """
+    out = []
     try:
-        url = f"https://api.marketaux.com/v1/news/all?countries=us&limit=20&api_token={MARKETAUX_TOKEN}"
-        r = requests.get(url, timeout=8, headers=HEADERS)
-        if r.status_code == 200:
-            j = r.json()
-            items = j.get("data",[]) or []
-            for n in items:
-                title = n.get("title","") or ""
-                lower = title.lower()
-                if any(k in lower for k in ["fed","cpi","inflation","interest","recession","jobs","gdp","earnings","ai","semiconductor","defense","nasa"]):
-                    headlines.append(f"- {title} ({n.get('source',{}).get('name','')})")
-                    if len(headlines) >= 6:
-                        break
-            if headlines:
-                used_source = "Marketaux"
-    except Exception as e:
-        log(f"marketaux err: {e}")
-
-    if not headlines:
-        try:
-            url2 = "https://finance.yahoo.com/news"
-            r2 = requests.get(url2, timeout=10, headers=HEADERS)
-            if r2.status_code == 200:
-                text = r2.text
-                found = re.findall(r'<h3.*?>(.*?)</h3>', text, flags=re.S|re.I)
-                for f in found:
-                    title = re.sub(r'<.*?>','', f).strip()
-                    title = unescape(title)
-                    if not title: continue
-                    low = title.lower()
-                    if any(k in low for k in ["fed","cpi","inflation","interest","recession","jobs","gdp","earnings","ai","semiconductor","defense","nasa"]):
-                        entry = f"- {title} (Yahoo News)"
-                        if entry not in headlines:
-                            headlines.append(entry)
-                    if len(headlines) >= 6:
-                        break
-                if headlines:
-                    used_source = "YahooNewsPage"
-        except Exception as e:
-            log(f"yahoo news page err: {e}")
-
-    if not headlines:
-        return {"headlines": ["- ไม่มีข่าวสำคัญที่มีผลต่อตลาด"], "source": used_source or "none"}
-    return {"headlines": headlines, "source": used_source or "unknown"}
-
-# --- Stock news (improved) ---
-def get_stock_news(ticker, extra_keywords=None):
-    headlines = []
-    used_sources = []
-    extra_keywords = extra_keywords or []
-    keywords = ["earnings","q3","q4","quarter","result","guidance","press release","contract","launch","mission","nasa","defense","acquir","acquisition","scitec","sci tec"] + [k.lower() for k in extra_keywords]
-
-    # Yahoo search endpoint
-    try:
-        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}"
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(ticker)}"
         r = requests.get(url, timeout=8, headers=HEADERS)
         if r.status_code == 200:
             j = r.json()
             news = j.get("news",[]) or []
             for n in news:
-                title = (n.get("title") or "").strip()
-                if not title: continue
-                low = title.lower()
-                if any(k in low for k in keywords):
-                    entry = f"- {title} ({n.get('publisher') or n.get('source','')})"
-                    if entry not in headlines:
-                        headlines.append(entry)
-                if len(headlines) >= 6:
-                    break
-            if headlines:
-                used_sources.append("YahooSearch")
+                title = n.get("title") or ""
+                urln = n.get("url") or n.get("link") or ""
+                publisher = n.get("publisher") or n.get("source") or ""
+                if urln:
+                    out.append({"title": title, "url": urln, "publisher": publisher})
     except Exception as e:
-        log(f"yahoo search err for {ticker}: {e}")
+        log("yahoo search err "+str(e))
+    # ensure unique by url
+    uniq = []
+    res = []
+    for a in out:
+        if a["url"] not in uniq:
+            uniq.append(a["url"])
+            res.append(a)
+    return res
 
-    # scrape quote news page
-    if len(headlines) < 6:
+def summarize_article_from_candidate(candidate, important_terms=None):
+    """
+    Given candidate {'title','url','publisher'} try to fetch article text and produce summary (EN).
+    Returns dict: {'title','url','publisher','summary_en'}
+    """
+    url = candidate.get("url","")
+    title = candidate.get("title","")
+    publisher = candidate.get("publisher","")
+    # try to fetch article page and extract text
+    text = fetch_url_text(url)
+    if not text:
+        # try to fetch meta description via HEAD or open graph
         try:
-            url_news = f"https://finance.yahoo.com/quote/{ticker}/news?p={ticker}"
-            r2 = requests.get(url_news, timeout=8, headers=HEADERS)
-            if r2.status_code == 200:
-                text = r2.text
-                found = re.findall(r'<h3.*?>(.*?)</h3>', text, flags=re.S|re.I)
-                for f in found:
-                    title = re.sub(r'<.*?>','', f).strip()
-                    title = unescape(title)
-                    low = title.lower()
-                    if any(k in low for k in keywords) or any(w.lower() in title.lower() for w in [ticker] + extra_keywords):
-                        entry = f"- {title} (Yahoo)"
-                        if entry not in headlines:
-                            headlines.append(entry)
-                    if len(headlines) >= 6:
-                        break
-                if headlines:
-                    used_sources.append("YahooQuoteNews")
+            r = requests.get(url, timeout=8, headers=HEADERS)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text,"html.parser")
+                desc = ""
+                meta = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", property="og:description")
+                if meta and meta.get("content"):
+                    desc = meta.get("content","")
+                text = desc
         except Exception as e:
-            log(f"yahoo quote news err for {ticker}: {e}")
+            log("meta fetch err "+str(e))
+    summary_en = ""
+    if text:
+        # create extractive summary (2-4 sentences depending length)
+        max_sents = 3 if len(text.split()) > 200 else 2
+        summary_en = make_extract_summary(text, important_terms=important_terms, max_sentences=max_sents)
+    # fallback to headline if summary empty
+    if not summary_en:
+        if title:
+            summary_en = title
+        else:
+            summary_en = "(เนื้อหาไม่สามารถดึงได้)"
+    return {"title": title, "url": url, "publisher": publisher, "summary_en": summary_en}
 
-    # press releases page
-    if len(headlines) < 6:
-        try:
-            url_pr = f"https://finance.yahoo.com/quote/{ticker}/press-releases?p={ticker}"
-            r3 = requests.get(url_pr, timeout=8, headers=HEADERS)
-            if r3.status_code == 200:
-                text = r3.text
-                found = re.findall(r'<h3.*?>(.*?)</h3>', text, flags=re.S|re.I)
-                for f in found:
-                    title = re.sub(r'<.*?>','', f).strip()
-                    title = unescape(title)
-                    low = title.lower()
-                    if any(k in low for k in keywords) or any(w.lower() in title.lower() for w in [ticker] + extra_keywords):
-                        entry = f"- {title} (Yahoo PR)"
-                        if entry not in headlines:
-                            headlines.append(entry)
-                    if len(headlines) >= 6:
-                        break
-                if headlines:
-                    used_sources.append("YahooPR")
-        except Exception as e:
-            log(f"yahoo pr err for {ticker}: {e}")
-
-    # alias search
-    if len(headlines) < 6:
-        comp_aliases = [ticker]
-        if ticker == "FLY":
-            comp_aliases += ["Firefly Aerospace", "Firefly"]
-        if ticker == "LUNR":
-            comp_aliases += ["Intuitive Machines", "LUNR"]
-        if ticker == "IONQ":
-            comp_aliases += ["IonQ", "IonQ Inc"]
-        for alias in comp_aliases:
-            if len(headlines) >= 6:
-                break
+def get_stock_summaries(ticker, extra_keywords=None):
+    """Return list of article summaries (EN) for ticker, prioritized to earnings/press/guidance."""
+    candidates = get_candidate_articles_from_yahoo(ticker)
+    # if not many candidates try alias search
+    if len(candidates) < 3:
+        aliases = [ticker]
+        if ticker == "FLY": aliases += ["Firefly Aerospace","Firefly SciTec","SciTec","Sci Tec"]
+        if ticker == "LUNR": aliases += ["Intuitive Machines"]
+        if ticker == "IONQ": aliases += ["IonQ", "IonQ Inc"]
+        for a in aliases:
+            if len(candidates) >= 6: break
             try:
-                url_a = f"https://query1.finance.yahoo.com/v1/finance/search?q={requests.utils.requote_uri(alias)}"
-                r4 = requests.get(url_a, timeout=6, headers=HEADERS)
-                if r4.status_code == 200:
-                    j4 = r4.json()
-                    news4 = j4.get("news",[]) or []
-                    for n in news4:
-                        title = (n.get("title") or "").strip()
-                        if not title: continue
-                        low = title.lower()
-                        if any(k in low for k in keywords):
-                            entry = f"- {title} ({n.get('publisher') or n.get('source','')})"
-                            if entry not in headlines:
-                                headlines.append(entry)
-                        if len(headlines) >= 6:
-                            break
-                    if news4:
-                        used_sources.append(f"YahooAlias:{alias}")
-            except Exception as e:
-                log(f"alias search err {alias}: {e}")
+                url = f"https://query1.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(a)}"
+                r = requests.get(url, timeout=6, headers=HEADERS)
+                if r.status_code == 200:
+                    j = r.json(); news = j.get("news",[]) or []
+                    for n in news:
+                        urln = n.get("url") or ""
+                        title = n.get("title") or ""
+                        publisher = n.get("publisher") or n.get("source") or ""
+                        if urln and all(urln != c["url"] for c in candidates):
+                            candidates.append({"title":title,"url":urln,"publisher":publisher})
+            except: pass
+    # prioritize candidates whose title contains target keywords
+    priority = []
+    for c in candidates:
+        t = (c.get("title") or "").lower()
+        if any(k in t for k in ["earnings","q3","q4","quarter","results","guidance","press","acquir","acquisition","contract","scitec","sci tec","firefly","sci-tec"]):
+            priority.insert(0,c)
+        else:
+            priority.append(c)
+    # summarize top 4
+    summaries = []
+    for c in priority[:6]:
+        s = summarize_article_from_candidate(c, important_terms=["earnings","revenue","guidance","contract","acquisition","launch","mission","backlog","profit","loss"])
+        summaries.append(s)
+    return summaries
 
-    if not headlines:
-        return {"headlines": ["- ไม่มีข้อมูลข่าว"], "source": ",".join(used_sources) if used_sources else "none"}
-    return {"headlines": headlines[:6], "source": ",".join(used_sources)}
-
-# --- Decision rules ---
+# ---------- Build and send report ----------
 def decision_rule(ticker, price, avg_cost):
-    if price is None:
-        return "No data"
-    if ticker == "LUNR":
-        if price <= 9.5:
-            return "Buy (DCA zone 8.5-9.5)"
-        elif price > 12:
-            return "Hold / consider trimming"
-    if ticker == "FLY":
-        if price <= 20:
-            return "Buy (zone 18.5-20)"
-        elif price > 30:
-            return "Hold / consider trim"
-    if ticker == "IONQ":
-        if price <= 50:
-            return "Buy (accumulate < 50)"
-        elif price > 56:
-            return "Hold / avoid adding"
-    if avg_cost and price < avg_cost * 0.9:
-        return "Consider adding (below your avg cost)"
+    if price is None: return "No data"
+    if ticker=="LUNR":
+        if price <= 9.5: return "Buy (DCA zone 8.5-9.5)"
+        elif price>12: return "Hold / consider trimming"
+    if ticker=="FLY":
+        if price <= 20: return "Buy (zone 18.5-20)"
+        elif price>30: return "Hold / consider trim"
+    if ticker=="IONQ":
+        if price <= 50: return "Buy (accumulate < 50)"
+        elif price>56: return "Hold / avoid adding"
     return "Hold"
 
-# --- Build message (translate headlines to Thai) ---
 def build_message():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
     header = f"📅 รายงานประจำวันที่ {now:%Y-%m-%d} (08:00 TH)\n\n"
-
-    # Market snapshot
+    # market snapshot
     try:
         sp = yf.Ticker("^GSPC").history(period="1d")["Close"][-1]
         nd = yf.Ticker("^IXIC").history(period="1d")["Close"][-1]
         dj = yf.Ticker("^DJI").history(period="1d")["Close"][-1]
         market_part = f"🌎 ตลาดเมื่อคืน\nS&P500 {round(sp,2)} | Nasdaq {round(nd,2)} | Dow {round(dj,2)}\n\n"
+    except: market_part = "🌎 ตลาดเมื่อคืน: (no data)\n\n"
+
+    # market news (try Marketaux then Yahoo)
+    mnews = []
+    try:
+        url = f"https://api.marketaux.com/v1/news/all?countries=us&limit=15&api_token={MARKETAUX_TOKEN}"
+        r = requests.get(url, timeout=8, headers=HEADERS)
+        if r.status_code==200:
+            j = r.json(); items = j.get("data",[]) or []
+            for n in items:
+                t = n.get("title",""); ifilter = t.lower()
+                if any(k in ifilter for k in ["fed","cpi","inflation","interest","recession","gdp","earnings","ai","defense"]):
+                    mnews.append({"title":t,"source":n.get("source",{}).get("name","")})
     except Exception as e:
-        log(f"market snapshot err: {e}")
-        market_part = "🌎 ตลาดเมื่อคืน: (no data)\n\n"
+        log("marketaux err "+str(e))
+    # fallback Yahoo news page if none
+    if not mnews:
+        try:
+            url2 = "https://finance.yahoo.com/news"
+            r2 = requests.get(url2, timeout=8, headers=HEADERS)
+            if r2.status_code==200:
+                soup = BeautifulSoup(r2.text,"html.parser")
+                for h3 in soup.find_all("h3")[:10]:
+                    t = h3.get_text().strip()
+                    if any(k in t.lower() for k in ["fed","cpi","inflation","interest","recession","gdp","earnings","ai","defense"]):
+                        mnews.append({"title":t,"source":"Yahoo News"})
+        except Exception as e:
+            log("yahoo news page err "+str(e))
+    # prepare market text (translate summary)
+    if mnews:
+        # join headlines and translate as a short block
+        eng_block = " | ".join([f"{i['title']}" for i in mnews[:5]])
+        th_block = translate_to_th(eng_block)
+        market_news_text = th_block
+    else:
+        market_news_text = "- ไม่มีข่าวสำคัญที่มีผลต่อตลาด"
 
-    # Market news (and translate)
-    mnews = get_market_news()
-    market_news = "📰 ข่าวสำคัญที่มีผลต่อตลาด:\n"
-    # join original headlines (english), then translate block to thai
-    original_market_text = "\n".join(mnews.get("headlines", ["- ไม่มีข่าวสำคัญที่มีผลต่อตลาด"]))
-    thai_market = translate_to_th(original_market_text)
-    # include translated headlines, and small note about source
-    market_news += thai_market + "\n"
-    market_news += f"\n(แหล่งข่าว: {mnews.get('source')})\n\n"
-    log(f"Market news source: {mnews.get('source')}; headlines_count={len(mnews.get('headlines',[]))}")
-
-    # Portfolio
-    portfolio = "━━━━━━━━━━━━━━\n📌 สถานะหุ้นในพอร์ต\n"
+    # portfolio build
+    port = "━━━━━━━━━━━━━━\n📌 สถานะหุ้นในพอร์ต\n"
     for t, avg in TICKERS.items():
-        info = get_price(t)
-        portfolio += f"\n🔹 {t}"
-        if info:
-            portfolio += f" — ${info['price']:.2f} ({info['pct']:+.2f}%)\n"
-            portfolio += f"avg: ${avg}\n"
-            portfolio += f"คำแนะนำ: {decision_rule(t, info['price'], avg)}\n"
+        info = None
+        try:
+            info = yf.Ticker(t).history(period="5d")
+            if not info.empty:
+                last = float(info['Close'][-1]); prev = float(info['Close'][-2]) if len(info['Close'])>1 else last
+                pct = (last-prev)/prev*100 if prev!=0 else 0.0
+                price_info = {"price":round(last,4),"pct":round(pct,2)}
+            else:
+                price_info = None
+        except Exception as e:
+            price_info = None
+        port += f"\n🔹 {t}"
+        if price_info:
+            port += f" — ${price_info['price']:.2f} ({price_info['pct']:+.2f}%)\n"
+            port += f"avg: ${avg}\n"
+            port += f"คำแนะนำ: {decision_rule(t, price_info['price'], avg)}\n"
         else:
-            portfolio += " — (no price data)\n"
+            port += " — (no price data)\n"
 
-        # stock news: get english headlines then translate
-        sn = get_stock_news(t)
-        eng_text = "\n".join(sn.get("headlines", ["- ไม่มีข้อมูลข่าว"]))
-        thai_text = translate_to_th(eng_text)
-        portfolio += "ข่าวของหุ้นนี้ (สรุปภาษาไทย):\n"
-        portfolio += thai_text + "\n"
-        portfolio += f"(แหล่ง: {sn.get('source')})\n"
-        log(f"{t} news source: {sn.get('source')}; headlines_count={len(sn.get('headlines',[]))}")
+        # get summaries for this ticker
+        summaries = get_stock_summaries(t)
+        if summaries:
+            # build english block of summaries (title + summary)
+            eng_sum_blocks = []
+            for s in summaries[:3]:
+                title = s.get("title") or ""
+                summary_en = s.get("summary_en") or ""
+                url = s.get("url") or ""
+                publisher = s.get("publisher") or ""
+                text_block = (title + ". " + summary_en).strip()
+                # limit length
+                if len(text_block) > 2000:
+                    text_block = text_block[:2000]
+                eng_sum_blocks.append(text_block + (f" ({publisher})" if publisher else ""))
+            eng_combined = "\n\n".join(eng_sum_blocks)
+            # translate to Thai
+            thai_summary = translate_to_th(eng_combined)
+            port += "ข่าวสำคัญ (สรุป):\n"
+            port += thai_summary + "\n"
+            # include first article link for reference
+            first_url = summaries[0].get("url") if summaries and summaries[0].get("url") else ""
+            if first_url:
+                port += f"🔗 อ่านต้นฉบับ: {first_url}\n"
+        else:
+            port += "ข่าวของหุ้นนี้: - ไม่มีข้อมูลข่าว\n"
 
-    summary = ("\n📌 สรุปคำแนะนำรวม:\n"
-               "- LUNR: เน้นสะสมในโซน 8.5–9.5\n"
-               "- FLY: สะสมเมื่อ < 20\n"
-               "- IONQ: สะสมเมื่อ < 50\n")
+    # final summary
+    final = ("\n📌 สรุปคำแนะนำรวม:\n- LUNR: เน้นสะสมในโซน 8.5–9.5\n- FLY: สะสมเมื่อ < 20\n- IONQ: สะสมเมื่อ < 50\n")
 
-    return header + market_part + market_news + portfolio + summary
+    # compose message
+    msg = header + market_part + "📰 ข่าวสำคัญที่มีผลต่อตลาด:\n" + market_news_text + "\n\n" + port + final
+    return msg
 
-# --- Send to Telegram ---
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
-        log("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID")
+        log("Missing TELEGRAM_TOKEN/CHAT_ID")
         return False
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
+    payload = {"chat_id":CHAT_ID,"text":message}
     try:
         r = requests.post(url, data=payload, timeout=15)
-        log(f"Telegram status: {r.status_code}")
-        try:
-            log(f"Telegram response: {r.json()}")
-        except:
-            log(f"Telegram text response: {r.text}")
-        return r.status_code == 200
+        log("tg status "+str(r.status_code))
+        return r.status_code==200
     except Exception as e:
-        log(f"tg send error: {e}")
+        log("tg send err "+str(e))
         return False
 
-# --- Main ---
 def main():
-    log("Starting daily_report.py")
+    log("Starting improved daily report")
     msg = build_message()
-    print(msg)  # visible in Actions log
+    print(msg[:4000])  # print first part to Actions log
     ok = send_telegram(msg)
     if ok:
         log("Message sent")
     else:
-        log("Failed to send message")
+        log("Failed to send")
 
 if __name__ == "__main__":
     main()
