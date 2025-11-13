@@ -1,4 +1,4 @@
-name: Daily Market Report (No Cost)
+name: Daily Market Report
 
 on:
   schedule:
