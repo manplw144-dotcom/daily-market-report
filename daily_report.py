@@ -1,4 +1,4 @@
-# daily_report_nocost.py
+# daily_report.py
 # No-cost daily report:
 # - fetch recent news (last 24h) for tickers
 # - extract article text, perform extractive summarization (keyword-weighted + position)
