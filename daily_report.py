@@ -123,7 +123,7 @@ def decision_rule(ticker, price, avg_cost):
 
 # --- Build message ---
 def build_message():
-    now = datetime.datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
     header = f"📅 รายงานประจำวันที่ {now:%Y-%m-%d} (08:00 TH)\n\n"
 
     # Market snapshot
