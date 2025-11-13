@@ -1,15 +1,17 @@
-name: Daily Market Report
+name: Daily Market Report (No Cost)
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # 01:00 UTC = 08:00 Thailand
-  workflow_dispatch: {}
+    - cron: "0 1 * * *"   # 08:00 Thailand (UTC+7 → UTC 01:00)
+  workflow_dispatch:
 
 jobs:
   report:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -19,16 +21,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance requests
+          pip install yfinance requests beautifulsoup4
 
-- name: Install deps
-  run: |
-    python -m pip install --upgrade pip
-    pip install yfinance requests beautifulsoup4
-
-      - name: Run daily report
+      - name: Run daily report (no-cost version)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python daily_report.py
+          python daily_report_nocost.py
