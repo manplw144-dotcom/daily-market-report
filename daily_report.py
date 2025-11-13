@@ -1,8 +1,7 @@
 # daily_report.py
-# Robust Daily Market + Portfolio report with stronger news fallbacks and logging
+# Enhanced Daily Market + Portfolio report (with English->Thai translation)
 # Requirements: yfinance, requests
 # Env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# Usage: commit and Run workflow; check Actions log for printed debug lines
 
 import os
 import re
@@ -10,6 +9,8 @@ from html import unescape
 import datetime
 import requests
 import yfinance as yf
+import urllib.parse
+import time
 
 # ---------- CONFIG ----------
 TICKERS = {
@@ -17,7 +18,7 @@ TICKERS = {
     "FLY": 24.635,
     "LUNR": 9.23
 }
-MARKETAUX_TOKEN = "demo"   # fallback; replace when you have API key
+MARKETAUX_TOKEN = "demo"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 # --------------------------------
 
@@ -25,8 +26,44 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 def log(s):
-    # print to Actions log — useful for debugging
     print(f"[DEBUG] {s}")
+
+# --- Translation helper: English -> Thai (uses public translate endpoint) ---
+def translate_to_th(text):
+    """
+    Translate given English text to Thai using unofficial Google translate endpoint.
+    Returns Thai text on success, otherwise returns original text.
+    """
+    if not text or text.strip() == "":
+        return text
+    try:
+        # batch small pieces to avoid very long URLs; handle up to ~2000 chars
+        q = str(text)
+        # encode
+        q_enc = urllib.parse.quote(q)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=th&dt=t&q={q_enc}"
+        r = requests.get(url, timeout=10, headers=HEADERS)
+        if r.status_code != 200:
+            log(f"translate status {r.status_code}")
+            return text
+        resp = r.json()
+        # resp is list of sentences -> join
+        translated = []
+        for part in resp[0]:
+            if len(part) > 0:
+                translated.append(part[0])
+        result = "".join(translated)
+        # minor cleanup
+        result = result.replace("  ", " ").strip()
+        # limit length
+        if len(result) > 4000:
+            result = result[:4000] + "..."
+        # small delay to be polite
+        time.sleep(0.1)
+        return result
+    except Exception as e:
+        log(f"translate err: {e}")
+        return text
 
 # --- Prices ---
 def get_price(ticker):
@@ -44,17 +81,16 @@ def get_price(ticker):
         log(f"price err {ticker}: {e}")
         return None
 
-# --- Market news (Marketaux -> Yahoo news page fallback) ---
+# --- Market news (Marketaux -> Yahoo fallback) ---
 def get_market_news():
     headlines = []
     used_source = None
-    # 1) try Marketaux demo API
     try:
         url = f"https://api.marketaux.com/v1/news/all?countries=us&limit=20&api_token={MARKETAUX_TOKEN}"
         r = requests.get(url, timeout=8, headers=HEADERS)
         if r.status_code == 200:
             j = r.json()
-            items = j.get("data", []) or []
+            items = j.get("data",[]) or []
             for n in items:
                 title = n.get("title","") or ""
                 lower = title.lower()
@@ -67,7 +103,6 @@ def get_market_news():
     except Exception as e:
         log(f"marketaux err: {e}")
 
-    # 2) fallback: scrape Yahoo finance news page
     if not headlines:
         try:
             url2 = "https://finance.yahoo.com/news"
@@ -91,26 +126,18 @@ def get_market_news():
         except Exception as e:
             log(f"yahoo news page err: {e}")
 
-    # 3) final fallback: return message none
     if not headlines:
         return {"headlines": ["- ไม่มีข่าวสำคัญที่มีผลต่อตลาด"], "source": used_source or "none"}
-    return {"headlines": headlines, "source": used_source}
+    return {"headlines": headlines, "source": used_source or "unknown"}
 
-# --- Stock-specific improved news (Yahoo search + quote news + press releases) ---
+# --- Stock news (improved) ---
 def get_stock_news(ticker, extra_keywords=None):
-    """
-    Return list of headlines and source info.
-    Tries:
-     - query1.finance.yahoo.com search
-     - finance.yahoo.com/quote/{ticker}/news?p={ticker}
-     - finance.yahoo.com/quote/{ticker}/press-releases?p={ticker}
-    """
     headlines = []
     used_sources = []
     extra_keywords = extra_keywords or []
     keywords = ["earnings","q3","q4","quarter","result","guidance","press release","contract","launch","mission","nasa","defense","acquir","acquisition","scitec","sci tec"] + [k.lower() for k in extra_keywords]
 
-    # 1) Yahoo search endpoint
+    # Yahoo search endpoint
     try:
         url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}"
         r = requests.get(url, timeout=8, headers=HEADERS)
@@ -125,13 +152,14 @@ def get_stock_news(ticker, extra_keywords=None):
                     entry = f"- {title} ({n.get('publisher') or n.get('source','')})"
                     if entry not in headlines:
                         headlines.append(entry)
-                if len(headlines)>=6: break
+                if len(headlines) >= 6:
+                    break
             if headlines:
                 used_sources.append("YahooSearch")
     except Exception as e:
         log(f"yahoo search err for {ticker}: {e}")
 
-    # 2) scrape quote news page
+    # scrape quote news page
     if len(headlines) < 6:
         try:
             url_news = f"https://finance.yahoo.com/quote/{ticker}/news?p={ticker}"
@@ -147,13 +175,14 @@ def get_stock_news(ticker, extra_keywords=None):
                         entry = f"- {title} (Yahoo)"
                         if entry not in headlines:
                             headlines.append(entry)
-                    if len(headlines)>=6: break
+                    if len(headlines) >= 6:
+                        break
                 if headlines:
                     used_sources.append("YahooQuoteNews")
         except Exception as e:
             log(f"yahoo quote news err for {ticker}: {e}")
 
-    # 3) scrape press releases page (if exists)
+    # press releases page
     if len(headlines) < 6:
         try:
             url_pr = f"https://finance.yahoo.com/quote/{ticker}/press-releases?p={ticker}"
@@ -169,16 +198,16 @@ def get_stock_news(ticker, extra_keywords=None):
                         entry = f"- {title} (Yahoo PR)"
                         if entry not in headlines:
                             headlines.append(entry)
-                    if len(headlines)>=6: break
+                    if len(headlines) >= 6:
+                        break
                 if headlines:
                     used_sources.append("YahooPR")
         except Exception as e:
             log(f"yahoo pr err for {ticker}: {e}")
 
-    # 4) extra: search by full company names via search endpoint
+    # alias search
     if len(headlines) < 6:
         comp_aliases = [ticker]
-        # common alias mapping for our tickers (so we catch Firefly press)
         if ticker == "FLY":
             comp_aliases += ["Firefly Aerospace", "Firefly"]
         if ticker == "LUNR":
@@ -202,7 +231,8 @@ def get_stock_news(ticker, extra_keywords=None):
                             entry = f"- {title} ({n.get('publisher') or n.get('source','')})"
                             if entry not in headlines:
                                 headlines.append(entry)
-                        if len(headlines) >= 6: break
+                        if len(headlines) >= 6:
+                            break
                     if news4:
                         used_sources.append(f"YahooAlias:{alias}")
             except Exception as e:
@@ -235,7 +265,7 @@ def decision_rule(ticker, price, avg_cost):
         return "Consider adding (below your avg cost)"
     return "Hold"
 
-# --- Build message with debug info ---
+# --- Build message (translate headlines to Thai) ---
 def build_message():
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
     header = f"📅 รายงานประจำวันที่ {now:%Y-%m-%d} (08:00 TH)\n\n"
@@ -250,11 +280,14 @@ def build_message():
         log(f"market snapshot err: {e}")
         market_part = "🌎 ตลาดเมื่อคืน: (no data)\n\n"
 
-    # Market news with debug
+    # Market news (and translate)
     mnews = get_market_news()
     market_news = "📰 ข่าวสำคัญที่มีผลต่อตลาด:\n"
-    for h in mnews.get("headlines", ["- ไม่มีข่าวสำคัญที่มีผลต่อตลาด"]):
-        market_news += h + "\n"
+    # join original headlines (english), then translate block to thai
+    original_market_text = "\n".join(mnews.get("headlines", ["- ไม่มีข่าวสำคัญที่มีผลต่อตลาด"]))
+    thai_market = translate_to_th(original_market_text)
+    # include translated headlines, and small note about source
+    market_news += thai_market + "\n"
     market_news += f"\n(แหล่งข่าว: {mnews.get('source')})\n\n"
     log(f"Market news source: {mnews.get('source')}; headlines_count={len(mnews.get('headlines',[]))}")
 
@@ -270,11 +303,12 @@ def build_message():
         else:
             portfolio += " — (no price data)\n"
 
-        # stock news
+        # stock news: get english headlines then translate
         sn = get_stock_news(t)
-        portfolio += "ข่าวของหุ้นนี้:\n"
-        for h in sn.get("headlines", ["- ไม่มีข้อมูลข่าว"]):
-            portfolio += h + "\n"
+        eng_text = "\n".join(sn.get("headlines", ["- ไม่มีข้อมูลข่าว"]))
+        thai_text = translate_to_th(eng_text)
+        portfolio += "ข่าวของหุ้นนี้ (สรุปภาษาไทย):\n"
+        portfolio += thai_text + "\n"
         portfolio += f"(แหล่ง: {sn.get('source')})\n"
         log(f"{t} news source: {sn.get('source')}; headlines_count={len(sn.get('headlines',[]))}")
 
