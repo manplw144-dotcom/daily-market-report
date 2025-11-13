@@ -1,9 +1,14 @@
 # daily_report.py
-# Daily Market + Portfolio report (enhanced)
-# Requirements: yfinance, requests
-# Env vars required: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+# Enhanced Daily Market + Portfolio report
+# - price from yfinance
+# - market news (Marketaux demo)
+# - improved Yahoo news scraper/keyword search for earnings/Qn/press
+# - sends message to Telegram (env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+# Requirements: pip install yfinance requests
 
 import os
+import re
+from html import unescape
 import datetime
 import requests
 import yfinance as yf
@@ -14,7 +19,7 @@ TICKERS = {
     "FLY": 24.635,
     "LUNR": 9.23
 }
-MARKETAUX_TOKEN = "demo"   # demo token; replace if you have key
+MARKETAUX_TOKEN = "demo"   # demo token; replace if you have a key
 # ----------------------------------------
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -46,10 +51,9 @@ def get_market_news():
         items = r.get("data", [])
         headlines = []
         for n in items:
-            title = n.get("title", "")
+            title = n.get("title", "") or ""
             lower = title.lower()
-            # filter for market-moving keywords
-            if any(k in lower for k in ["fed", "cpi", "inflation", "interest", "recession", "jobs", "unemployment", "gdp", "debt ceiling", "shutdown", "earnings", "earnings report", "bank", "rate cut", "rate hike", "ai", "semiconductor", "defense", "nasa"]):
+            if any(k in lower for k in ["fed", "cpi", "inflation", "interest", "recession", "jobs", "unemployment", "gdp", "debt ceiling", "shutdown", "earnings", "bank", "rate cut", "rate hike", "ai", "semiconductor", "defense", "nasa"]):
                 headlines.append(f"- {title} ({n.get('source', {}).get('name','')})")
             if len(headlines) >= 5:
                 break
@@ -61,39 +65,100 @@ def get_market_news():
         return "- ไม่พบข้อมูลข่าวตลาด"
 
 
-# --- Stock-specific earnings/PR news via Yahoo Search (targets earnings/guidance/etc.) ---
-def get_yahoo_news(ticker):
+# --- Improved Yahoo news scraper + keyword search (earnings/press/guidance) ---
+def get_yahoo_news_improved(ticker):
+    """
+    Improved: search by ticker and by company keywords, scrape Yahoo quote news page,
+    and filter for earnings/Qn/press/guidance/contract/launch keywords.
+    Returns up to 6 relevant headlines.
+    """
+    headlines = []
     try:
-        # Query Yahoo search endpoint (public)
-        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}"
-        r = requests.get(url, timeout=10).json()
-        news = r.get("news", []) or []
-        headlines = []
-        for n in news[:10]:
-            title = n.get("title", "") or ""
-            lower = title.lower()
-            # capture earnings, quarter, guidance, press release, acquisition, contract, launch, mission, acquisition
-            if any(k in lower for k in ["earnings", "q3", "q4", "quarter", "result", "guidance", "press release", "acquir", "acquisition", "contract", "launch", "mission", "nasa", "defense", "sci tec", "scitec", "merger", "agreement", "closing"]):
-                headlines.append(f"- {n.get('title')} ({n.get('publisher','') or n.get('source','')})")
-        # If none found with targeted keywords, still provide up to 3 recent headlines
-        if not headlines:
-            for n in news[:3]:
-                title = n.get("title", "")
-                if title:
-                    headlines.append(f"- {title} ({n.get('publisher','') or n.get('source','')})")
-        if not headlines:
-            return "- ไม่มีข่าวสำคัญ"
-        # remove duplicates & limit length
-        uniq = []
-        for h in headlines:
-            if h not in uniq:
-                uniq.append(h)
-            if len(uniq) >= 5:
+        # 1) Yahoo search endpoint
+        url_search = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker}"
+        r = requests.get(url_search, timeout=8)
+        js = r.json() if r.status_code == 200 else {}
+        news = js.get("news", []) or []
+        for n in news:
+            title = (n.get("title") or "").strip()
+            if not title:
+                continue
+            low = title.lower()
+            if any(k in low for k in ["earnings", "q3", "q4", "quarter", "result", "guidance", "press release", "acquir", "acquisition", "contract", "launch", "mission", "nasa", "defense", "scitec", "sci tec", "firefly"]):
+                headlines.append(f"- {title} ({n.get('publisher') or n.get('source','')})")
+            if len(headlines) >= 6:
                 break
-        return "\n".join(uniq)
+
+        # 2) Scrape Yahoo news page for the ticker
+        if len(headlines) < 6:
+            try:
+                url_news_page = f"https://finance.yahoo.com/quote/{ticker}/news?p={ticker}"
+                r2 = requests.get(url_news_page, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                if r2.status_code == 200:
+                    text = r2.text
+                    found = re.findall(r'<h3.*?>(.*?)</h3>', text, flags=re.S | re.I)
+                    for f in found:
+                        title = re.sub(r'<.*?>', '', f).strip()
+                        title = unescape(title)
+                        low = title.lower()
+                        if title and any(k in low for k in ["earnings", "q3", "q4", "quarter", "result", "guidance", "press release", "contract", "launch", "mission", "scitec", "firefly", "sci tec"]):
+                            entry = f"- {title} (Yahoo)"
+                            if entry not in headlines:
+                                headlines.append(entry)
+                        if len(headlines) >= 6:
+                            break
+            except Exception:
+                pass
+
+        # 3) Search by company keywords for broader coverage
+        if len(headlines) < 6:
+            keywords = [ticker, "Firefly Aerospace", "SciTec", "Firefly", "Firefly SciTec", "Sci Tec"]
+            for kw in keywords:
+                try:
+                    url_kw = f"https://query1.finance.yahoo.com/v1/finance/search?q={requests.utils.requote_uri(kw)}"
+                    r3 = requests.get(url_kw, timeout=6)
+                    j3 = r3.json() if r3.status_code == 200 else {}
+                    news3 = j3.get("news", []) or []
+                    for n in news3:
+                        title = (n.get("title") or "").strip()
+                        if not title:
+                            continue
+                        low = title.lower()
+                        if any(k in low for k in ["earnings", "q3", "q4", "quarter", "result", "guidance", "press release", "acquir", "contract", "launch", "mission", "scitec"]):
+                            entry = f"- {title} ({n.get('publisher') or n.get('source','')})"
+                            if entry not in headlines:
+                                headlines.append(entry)
+                        if len(headlines) >= 6:
+                            break
+                except Exception:
+                    continue
+                if len(headlines) >= 6:
+                    break
+
     except Exception as e:
-        print("yahoo news err", ticker, e)
+        print("get_yahoo_news_improved err:", e)
+
+    # fallback: if still empty, return up to 3 recent headlines from initial search
+    if not headlines:
+        try:
+            if news:
+                for n in news[:3]:
+                    title = n.get("title", "")
+                    if title:
+                        headlines.append(f"- {title} ({n.get('publisher') or n.get('source','')})")
+        except Exception:
+            pass
+
+    if not headlines:
         return "- ไม่มีข้อมูลข่าว"
+    # dedupe & limit
+    uniq = []
+    for h in headlines:
+        if h not in uniq:
+            uniq.append(h)
+        if len(uniq) >= 6:
+            break
+    return "\n".join(uniq)
 
 
 # --- Simple decision rules (customize as needed) ---
@@ -115,7 +180,6 @@ def decision_rule(ticker, price, avg_cost):
             return "Buy (accumulate < 50)"
         elif price > 56:
             return "Hold / avoid adding (high valuation)"
-    # fallback: compare to avg_cost
     if avg_cost and price < avg_cost * 0.9:
         return "Consider adding (below your avg cost)"
     return "Hold"
@@ -127,7 +191,6 @@ def build_message():
     header = f"📅 รายงานประจำวันที่ {now:%Y-%m-%d} (08:00 TH)\n\n"
 
     # Market snapshot
-    market_part = ""
     try:
         sp = yf.Ticker("^GSPC").history(period="1d")["Close"][-1]
         nd = yf.Ticker("^IXIC").history(period="1d")["Close"][-1]
@@ -148,17 +211,15 @@ def build_message():
         if info:
             portfolio += f" — ${info['price']:.2f} ({info['pct']:+.2f}%)\n"
             portfolio += f"avg: ${avg}\n"
-            # recommendation
             rec = decision_rule(t, info['price'], avg)
             portfolio += f"คำแนะนำ: {rec}\n"
         else:
             portfolio += " — (no price data)\n"
 
-        # stock-specific news via Yahoo
+        # stock-specific news via improved Yahoo function
         portfolio += "ข่าวของหุ้นนี้:\n"
-        portfolio += get_yahoo_news(t) + "\n"
+        portfolio += get_yahoo_news_improved(t) + "\n"
 
-    # Summary suggestion
     summary = ("\n📌 สรุปคำแนะนำรวม:\n"
                "- LUNR: เน้นสะสมในโซน 8.5–9.5\n"
                "- FLY: สะสมเมื่อ < 20\n"
